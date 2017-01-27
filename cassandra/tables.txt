@@ -1,0 +1,87 @@
+// =========
+// For select and upsert queries, see CassandraRecordingDatabase.java
+//
+// Cassandra's native TTL function is used to expire data, if expiration is enabled. It is important when a TTL or other perspective 
+// metadata is used or updated that every copy of it gets updated.
+//
+// Tables use COMPACT STORAGE which makes cassandra's data overhead smaller, but has certain limitations like that there can only
+// be one non-primary-key field. See more info here: http://blog.librato.com/posts/cassandra-compact-storage
+// =========
+
+
+// A table of the master versions of recorded perspectives' metadata. A "perspective" is a stream of captured data referring to an 
+// individual user in an individual session.
+//
+// Uses compression chunk size of 4kb because this table will be relatively small, will be read from/written to in small 
+// chunks, and read performance is more important than compression ratio.
+//
+// perspectiveId: the unique id for the perspective. Used as the row and partition key.
+// metadata: the serialized contents of the metadata.
+CREATE TABLE PerspectiveMetadata
+(
+    perspectiveId UUID PRIMARY KEY,
+    metadata BLOB
+) WITH COMPACT STORAGE AND COMPRESSION = {'sstable_compression': 'LZ4Compressor', 'chunk_length_kb': 4 };
+
+
+// A table of chunks of a recorded perspective.
+//
+// Uses default fairly large 64kb compression chunk size because these will be the biggest, most numerous records that are read the 
+// least and most often hover around a 32-128KB size or somewhere around that. 
+// 
+// perspectiveId: unique id for the perspective. Used as the row and partition key.
+// chunkId: the integer id of what piece of this perspective is stored here, where 1 is the first chunk of recorded events, 2 
+//          is the second chunk of recorded events, and so on.
+// chunkData: the serialized contents of the data chunk.
+CREATE TABLE PerspectiveChunk
+(
+    perspectiveId UUID,
+    chunkId INT,
+    chunkData BLOB,
+    PRIMARY KEY(perspectiveId, chunkId)
+) WITH COMPACT STORAGE;
+
+    
+// A table of searchable tags that also can have arbitrary and potentially changing client-defined metadata attached.
+// 
+// Does not use compact storage because the storage size of this will be negligible compared to the other tables and 
+// we need a secondary index to search by perspective id, which compact storage does not support.
+//
+// Uses compression chunk size of 4kb because this table will be relatively small, will be read from/written to in small 
+// chunks, and read performance is more important than compression ratio here.
+//
+// tagName: The unique string name of the tag.
+// perspectiveId: the id of the tagged perspective for this row.
+// metadata: a serialized-to-bytes thrift PerspectiveMetadata object of the tagged perspective's metadata.
+CREATE TABLE PerspectiveTag
+(
+    tagName VARCHAR,
+    perspectiveId UUID,
+    metadata BLOB,
+    PRIMARY KEY (tagName, perspectiveId)
+) WITH COMPRESSION = {'sstable_compression': 'LZ4Compressor', 'chunk_length_kb': 4 };
+CREATE INDEX perspectiveIndex ON PerspectiveTag (perspectiveId);
+
+
+// A table for storing (generally large) blobs only once so they can be deduplicated. Deduplication makes a tradeoff in performance, in terms of 
+// having to first fetch the recording, then separately fetch any deduplicated blobs. However, testing has shown that this strategy can have a HUGE 
+// impact on recording storage sizes, especially for shorter recordings in identically starting worlds that are comprised largely of repeated 
+// chunk packets (such as minigames and hubs).
+//
+// Uses 16kb chunk size because stored blobs will often be accessed individually and often and not necessarily have any meaningful relationship to 
+// nearby blobs. They need read efficiency and will not sacrifice much in compression ratio. 
+//
+// blobSpaceKey: An arbitrary key used to narrow down blobs by context. An example key is the name of the world for a chunk packet. It is very unlikely
+//               the server will need to know about that chunk packet unless it loads that world.
+// hash: a hash of the blob's contents, which must be unique.
+// byteSize: the byte-size of the blob. Minorly helps guarantee uniqueness.
+// bytes: the blob's full contents.
+CREATE TABLE DeduplicatedBlob
+(
+    blobSpaceKey TEXT,
+    hash BLOB,
+    byteSize BIGINT,
+    bytes BLOB,
+    PRIMARY KEY(blobSpaceKey, hash, byteSize)
+) WITH COMPACT STORAGE AND COMPRESSION = {'sstable_compression': 'LZ4Compressor', 'chunk_length_kb': 16 };
+
